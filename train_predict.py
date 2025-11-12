@@ -5,17 +5,18 @@ import os
 import rasterio
 import geopandas as gpd
 import pandas as pd
-from rasterio.features import rasterize
+from rasterio.features import rasterize, shapes
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw, ImageFont
 import segmentation_models_pytorch as smp
 import warnings
 from segmentation_models_pytorch.losses import DiceLoss
+from shapely.geometry import shape, Polygon, MultiPolygon
 
 warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
 
 
-# --- 1단계, 2단계, 3단계 함수는 이전과 동일합니다 (변경 없음) ---
+# --- 1단계: 학습용 데이터 조각 일괄 생성 ---
 def create_training_chips_batch(tif_dir, gpkg_dir, output_dir, chip_size=512):
     print("--- 1단계: 학습용 데이터 조각 일괄 생성을 시작합니다 ---")
     img_out_dir = os.path.join(output_dir, 'images')
@@ -58,6 +59,7 @@ def create_training_chips_batch(tif_dir, gpkg_dir, output_dir, chip_size=512):
     print(f"총 {len(tif_files)}개의 TIF 파일로부터 {chip_count}개의 학습용 데이터 조각을 생성했습니다.")
 
 
+# --- 2단계: 데이터셋 클래스 ---
 class LodgedRiceDataset(Dataset):
     def __init__(self, image_dir, mask_dir):
         self.image_dir, self.mask_dir = image_dir, mask_dir
@@ -78,6 +80,7 @@ class LodgedRiceDataset(Dataset):
         return torch.from_numpy(image), torch.from_numpy(mask)
 
 
+# --- 3단계: AI 모델 학습 ---
 def train_lodged_rice_model(data_dir, model_save_path):
     print("\n--- 2단계: AI 모델 학습을 시작합니다 ---")
     dataset = LodgedRiceDataset(os.path.join(data_dir, 'images'), os.path.join(data_dir, 'masks'))
@@ -106,29 +109,101 @@ def train_lodged_rice_model(data_dir, model_save_path):
     return model
 
 
-# --- 4단계: ✨ 이미지 저장 라이브러리를 Pillow로 교체한 최종 예측 함수 ---
-def predict_batch(model, predict_dir, output_dir, chip_size=512):
+# --- 4단계: 예측 마스크를 GPKG 벡터로 변환하는 함수 (새로 추가) ---
+def mask_to_gpkg(mask_array, transform, crs, output_path, simplify_tolerance=1.0):
+    """
+    예측된 마스크(래스터)를 벡터 폴리곤으로 변환하여 GPKG 파일로 저장합니다.
+
+    Args:
+        mask_array: 예측 마스크 배열 (0과 1로 구성)
+        transform: rasterio transform 객체
+        crs: 좌표계 (CRS)
+        output_path: 저장할 GPKG 파일 경로
+        simplify_tolerance: 폴리곤 단순화 허용오차 (픽셀 단위, 클수록 단순화)
+    """
+    # 마스크에서 폴리곤 추출
+    polygon_generator = shapes(mask_array.astype(np.int16), mask=(mask_array == 1), transform=transform)
+
+    polygons = []
+    for geom, value in polygon_generator:
+        if value == 1:  # 도복 영역만 추출
+            poly = shape(geom)
+            # 폴리곤 단순화 (노이즈 제거)
+            if simplify_tolerance > 0:
+                poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+
+            # 유효한 폴리곤만 추가
+            if poly.is_valid and not poly.is_empty:
+                # 면적이 너무 작은 폴리곤 제거 (노이즈 제거)
+                if poly.area > (simplify_tolerance * simplify_tolerance):
+                    polygons.append(poly)
+
+    if not polygons:
+        print(f"  경고: 추출할 폴리곤이 없습니다. GPKG 파일을 생성하지 않습니다.")
+        return False
+
+    # GeoDataFrame 생성
+    gdf = gpd.GeoDataFrame({
+        'id': range(len(polygons)),
+        'area_m2': [poly.area for poly in polygons],
+        'geometry': polygons
+    }, crs=crs)
+
+    # GPKG 파일로 저장
+    gdf.to_file(output_path, driver='GPKG')
+    print(f"  -> GPKG 파일 저장 완료: {output_path} ({len(polygons)}개 폴리곤)")
+    return True
+
+
+# --- 5단계: 예측 및 GPKG 저장 (개선된 버전) ---
+def predict_batch(model, predict_dir, output_dir, chip_size=512, save_gpkg=True, simplify_tolerance=1.0):
+    """
+    새로운 필지들에 대한 일괄 예측을 수행하고 결과를 저장합니다.
+
+    Args:
+        model: 학습된 모델
+        predict_dir: 예측할 TIF 파일이 있는 디렉토리
+        output_dir: 결과를 저장할 디렉토리
+        chip_size: 조각 크기 (기본값: 512)
+        save_gpkg: GPKG 파일 저장 여부 (기본값: True)
+        simplify_tolerance: 폴리곤 단순화 허용오차 (기본값: 1.0)
+    """
     print("\n--- 3단계: 새로운 필지들에 대한 일괄 예측을 시작합니다 ---")
     os.makedirs(output_dir, exist_ok=True)
+
+    # GPKG 저장 폴더 생성
+    if save_gpkg:
+        gpkg_output_dir = os.path.join(output_dir, 'predicted_gpkg')
+        os.makedirs(gpkg_output_dir, exist_ok=True)
+        print(f"예측된 마스크를 GPKG 파일로 저장합니다: {gpkg_output_dir}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
+
     predict_files = sorted([f for f in os.listdir(predict_dir) if f.endswith('.tif')])
     if not predict_files:
         print(f"경고: '{predict_dir}' 폴더에서 예측할 TIF 파일을 찾을 수 없습니다.")
         return
+
     results = []
     for tif_file in predict_files:
-        print(f"예측 중: {tif_file}")
-        with rasterio.open(os.path.join(predict_dir, tif_file)) as raster:
+        print(f"\n예측 중: {tif_file}")
+        base_name = os.path.splitext(tif_file)[0]
+        tif_path = os.path.join(predict_dir, tif_file)
+
+        with rasterio.open(tif_path) as raster:
             pixel_width, pixel_height = raster.res
             pixel_area_m2 = pixel_width * pixel_height
             prediction_full = np.zeros((raster.height, raster.width), dtype=np.uint8)
+
+            # 전체 이미지 예측
             for j in range(0, raster.height, chip_size):
                 for i in range(0, raster.width, chip_size):
                     window = rasterio.windows.Window(i, j, chip_size, chip_size)
                     img_chip = raster.read([1, 2, 3], window=window)
-                    if img_chip.max() == 0: continue
+                    if img_chip.max() == 0:
+                        continue
                     h, w = img_chip.shape[1], img_chip.shape[2]
                     padded_chip = np.zeros((3, chip_size, chip_size), dtype=img_chip.dtype)
                     padded_chip[:, :h, :w] = img_chip
@@ -140,62 +215,61 @@ def predict_batch(model, predict_dir, output_dir, chip_size=512):
                     pred_mask = (pred.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
                     prediction_full[j:j + h, i:i + w] = pred_mask[:h, :w]
 
+            # 통계 계산
             lodged_pixels = np.sum(prediction_full)
             ratio = lodged_pixels / prediction_full.size
             lodged_area_m2 = lodged_pixels * pixel_area_m2
             lodged_area_pyeong = lodged_area_m2 / 3.3058
 
-            output_vis_path = os.path.join(output_dir, os.path.splitext(tif_file)[0] + '_prediction.png')
+            # GPKG 파일 저장 (새로 추가)
+            if save_gpkg:
+                gpkg_output_path = os.path.join(gpkg_output_dir, base_name + '.gpkg')
+                mask_to_gpkg(
+                    prediction_full,
+                    raster.transform,
+                    raster.crs,
+                    gpkg_output_path,
+                    simplify_tolerance=simplify_tolerance
+                )
 
-            # --- ✨ 수정된 이미지 처리 및 저장 로직 (Pillow 사용) ---
+            # 시각화 이미지 저장
+            output_vis_path = os.path.join(output_dir, base_name + '_prediction.png')
             original_img_data = np.transpose(raster.read([1, 2, 3]), (1, 2, 0))
             if original_img_data.dtype == 'uint16':
                 original_img_uint8 = (original_img_data / 256).astype(np.uint8)
             else:
                 original_img_uint8 = original_img_data.astype(np.uint8)
 
-            # 1. 원본 이미지를 Pillow Image 객체로 변환
             base_image = Image.fromarray(original_img_uint8).convert("RGBA")
-
-            # 2. 마스크를 씌울 오버레이 이미지를 Pillow로 생성 (빨간색, 40% 투명도)
             overlay = Image.new("RGBA", base_image.size)
-            overlay_draw = ImageDraw.Draw(overlay)
-            # 픽셀 단위로 직접 접근하여 마스크 그리기
             pixels = overlay.load()
             for y in range(base_image.height):
                 for x in range(base_image.width):
                     if prediction_full[y, x] == 1:
-                        pixels[x, y] = (255, 0, 0, int(255 * 0.4))  # R, G, B, Alpha (투명도)
+                        pixels[x, y] = (255, 0, 0, int(255 * 0.4))
 
-            # 3. 원본과 오버레이를 알파 채널을 이용해 합성
             final_image = Image.alpha_composite(base_image, overlay)
-
-            # 4. 이미지에 텍스트 추가
             draw = ImageDraw.Draw(final_image)
+
             try:
-                # 폰트가 시스템에 있는 경우 사용
                 font = ImageFont.truetype("malgun.ttf", 40)
             except IOError:
-                # 없는 경우 기본 폰트 사용
                 font = ImageFont.load_default()
 
             text1 = f"File: {tif_file}"
             text2 = f"Lodged Ratio: {ratio * 100:.2f}%"
             text3 = f"Lodged Area: {lodged_area_m2:.2f} m2 ({lodged_area_pyeong:.2f} pyeong)"
 
-            draw.rectangle([(10, 10), (900, 160)], fill=(0, 0, 0, 180))  # 반투명 검정 배경
+            draw.rectangle([(10, 10), (900, 160)], fill=(0, 0, 0, 180))
             draw.text((20, 20), text1, font=font, fill=(255, 255, 255, 255))
             draw.text((20, 65), text2, font=font, fill=(255, 255, 255, 255))
             draw.text((20, 110), text3, font=font, fill=(255, 255, 255, 255))
 
-            # 5. Pillow로 최종 이미지 저장
             try:
-                print(f"결과 이미지 저장 시도: {output_vis_path}")
                 final_image.save(output_vis_path, "PNG")
-                print("-> 이미지 저장 성공!")
+                print(f"  -> 시각화 이미지 저장: {output_vis_path}")
             except Exception as e:
-                print(f"-> !!! 이미지 저장 실패 !!! 원인: {e}")
-            # --- ✨ 여기까지 수정 ---
+                print(f"  -> 이미지 저장 실패: {e}")
 
             results.append({
                 'filename': tif_file,
@@ -204,14 +278,18 @@ def predict_batch(model, predict_dir, output_dir, chip_size=512):
                 'lodged_area(pyeong)': round(lodged_area_pyeong, 2)
             })
 
+    # CSV 저장
     df = pd.DataFrame(results)
     csv_path = os.path.join(output_dir, 'prediction_results.csv')
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     print(f"\n모든 예측 완료! 결과가 '{output_dir}' 폴더에 저장되었습니다.")
+    if save_gpkg:
+        print(f"예측된 마스크가 '{gpkg_output_dir}' 폴더에 GPKG 파일로 저장되었습니다.")
+        print("이 GPKG 파일들을 수정하여 새로운 학습 데이터로 사용할 수 있습니다!")
     print(df)
 
 
-# --- 메인 실행 흐름 (변경 없음) ---
+# --- 메인 실행 흐름 ---
 if __name__ == '__main__':
     script_dir = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(script_dir, 'data')
@@ -227,6 +305,17 @@ if __name__ == '__main__':
         print(f"'{TRAIN_TIF_DIR}' 와 '{TRAIN_GPKG_DIR}' 경로를 확인해주세요.")
         exit()
 
+    # 1단계: 학습 데이터 생성
     create_training_chips_batch(TRAIN_TIF_DIR, TRAIN_GPKG_DIR, TRAINING_CHIPS_DIR)
+
+    # 2단계: 모델 학습
     trained_model = train_lodged_rice_model(TRAINING_CHIPS_DIR, MODEL_PATH)
-    predict_batch(trained_model, PREDICT_TIF_DIR, PREDICTIONS_DIR)
+
+    # 3단계: 예측 및 GPKG 저장
+    predict_batch(
+        trained_model,
+        PREDICT_TIF_DIR,
+        PREDICTIONS_DIR,
+        save_gpkg=True,  # GPKG 저장 활성화
+        simplify_tolerance=1.0  # 폴리곤 단순화 정도 (1.0 = 적당한 단순화)
+    )
