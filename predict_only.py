@@ -115,7 +115,7 @@ def predict_batch(model, predict_dir, output_dir, chip_size=512):
 if __name__ == '__main__':
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    PREDICT_TIF_DIR = os.path.join(script_dir, 'data', 'GR')
+    PREDICT_TIF_DIR = os.path.join(script_dir, 'data', 'hw')
     MODEL_PATH = os.path.join(script_dir, 'lodged_rice_model_final.pth')
     PREDICTIONS_DIR = os.path.join(script_dir, 'predictions')
 
